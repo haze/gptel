@@ -3350,15 +3350,21 @@ buffer created or switched to.
 INTERACTIVEP is t when gptel is called interactively."
   (interactive
    (let* ((backend (default-value 'gptel-backend))
+          (project (project-current))
           (backend-name
-           (format "*%s*" (gptel-backend-name backend))))
+           (if project
+               (format "*%s (%s)*" (gptel-backend-name backend) (project-name project))
+             (format "*%s*" (gptel-backend-name backend)))))
      (list (read-buffer
             "Create or choose gptel buffer: "
             backend-name nil                         ; DEFAULT and REQUIRE-MATCH
             (lambda (b)                                   ; PREDICATE
               ;; NOTE: buffer check is required (#450)
               (and-let* ((buf (get-buffer (or (car-safe b) b))))
-                (buffer-local-value 'gptel-mode buf))))
+                (let ((buffer-project (with-current-buffer buf (project-current))))
+                  (and
+                   (eq project buffer-project)
+                   (buffer-local-value 'gptel-mode buf))))))
            (condition-case nil
                (gptel--get-api-key
                 (gptel-backend-key backend))
