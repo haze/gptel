@@ -37,18 +37,21 @@
 (eval-when-compile (require 'transient))
 
 ;;;; MCP integration - requires the mcp package
+(declare-function mcp-stop-server "mcp")
+(declare-function mcp--get-server-key "mcp")
+
 (declare-function mcp-hub-get-all-tool "mcp-hub")
 (declare-function mcp-hub-get-servers "mcp-hub")
 (declare-function mcp-hub-start-all-server "mcp-hub")
-(declare-function mcp-stop-server "mcp")
 (declare-function mcp-hub "mcp-hub")
 (declare-function mcp--status "mcp-hub")
 (declare-function mcp--tools "mcp-hub")
 (declare-function mcp-make-text-tool "mcp-hub")
+
 (defvar mcp-hub-servers)
 (defvar mcp-server-connections)
 
-(defun gptel-mcp-connect (&optional servers server-callback interactive)
+(defun gptel-mcp-connect (buffer &optional servers server-callback interactive)
   "Add gptel tools from MCP servers using the mcp package.
 
 MCP servers are started if required.  SERVERS is a list of server
@@ -59,7 +62,7 @@ If INTERACTIVE is non-nil (or called interactively), guide the user
 through setting up mcp, and query for servers to retrieve tools from.
 
 Call SERVER-CALLBACK after starting MCP servers."
-  (interactive (list nil nil t))
+  (interactive (list (or mcp-hub--buffer (current-buffer)) nil nil t))
   (if (locate-library "mcp-hub")
       (unless (require 'mcp-hub nil t)
         (user-error "Could not load `mcp-hub'!  Please install\
@@ -92,16 +95,16 @@ Call SERVER-CALLBACK after starting MCP servers."
                     unregistered-servers))
                  (server-active-p
                   (lambda (server)
-                    (when-let* ((server (gethash (car server) mcp-server-connections)))
+                    (when-let* ((server (gethash (mcp--get-server-key buffer (car server)) mcp-server-connections)))
                       (equal (mcp--status server) 'connected))))
                  (inactive-servers (cl-remove-if server-active-p servers))
                  (add-all-tools
                   (lambda (&optional server-names)
                     "Register and add tools from servers.  Report failures."
-                    (let ((tools (gptel-mcp--get-tools server-names))
+                    (let ((tools (gptel-mcp--get-tools buffer server-names))
                           (now-active (cl-remove-if-not server-active-p mcp-hub-servers)))
                       (mapc (lambda (tool) (apply #'gptel-make-tool tool)) tools)
-                      (gptel-mcp--activate-tools tools)
+                      (gptel-mcp--activate-tools buffer tools)
                       (if-let* ((failed (cl-set-difference inactive-servers now-active
                                                            :test #'equal)))
                           (progn
@@ -120,18 +123,19 @@ Call SERVER-CALLBACK after starting MCP servers."
 
             (if inactive-servers        ;start servers
                 (mcp-hub-start-all-server
+                 buffer
                  add-all-tools (mapcar #'car inactive-servers))
               (funcall add-all-tools (mapcar #'car servers))))
         (message "All MCP tools are already available to gptel!")
         (when (functionp server-callback) (funcall server-callback))))))
 
-(defun gptel-mcp-disconnect (&optional servers interactive)
+(defun gptel-mcp-disconnect (buffer &optional servers interactive)
   "Unregister gptel tools provided by MCP servers using the mcp package.
 
 SERVERS is a list of server names (strings) to disconnect from.
 
 If INTERACTIVE is non-nil, query the user about which tools to remove."
-  (interactive (list nil t))
+  (interactive (list (or mcp-hub--buffer (current-buffer)) nil t))
   (if-let* ((names-alist
              (cl-loop
               for (category . _tools) in gptel--known-tools
@@ -142,7 +146,7 @@ If INTERACTIVE is non-nil, query the user about which tools to remove."
       (let ((remove-fn (lambda (cat-names)
                          (setq gptel-tools ;Remove from gptel-tools
                                (cl-delete-if (lambda (tool) (member (gptel-tool-category tool)
-                                                               cat-names))
+                                                                    cat-names))
                                              gptel-tools))
                          (mapc (lambda (category) ;Remove from registry
                                  (setf (alist-get category gptel--known-tools
@@ -157,35 +161,41 @@ If INTERACTIVE is non-nil, query the user about which tools to remove."
                           nil t)))
               (when (member "ALL" server-names)
                 (setq server-names (mapcar #'car names-alist)))
-              (funcall remove-fn        ;remove selected tool categories
+              (funcall remove-fn      ;remove selected tool categories
                        (mapcar (lambda (s) (cdr (assoc s names-alist))) server-names))
               (if (y-or-n-p
                    (format "Removed MCP tools from %d server%s.  Also shut down MCP servers?"
                            (length server-names)
                            (if (= (length server-names) 1) "" "s")))
-                  (progn (mapc #'mcp-stop-server server-names)
+                  (progn (mapc (lambda (server-name) (mcp-stop-server buffer server-name)) server-names)
                          (message "Shut down MCP servers: %S" server-names))
                 (message "Removed MCP tools for: %S" server-names)))
           (funcall remove-fn (mapcar #'cdr names-alist))))
     ;; No MCP tools, ask to shut down servers
-    (if (cl-loop
-         for v being the hash-values of mcp-server-connections
-         never v)
+    (if (null (gptel-mcp--get-server-names-from-existing-connections buffer))
         (when interactive (message "No MCP servers active!"))
       (when (or (not interactive)
                 (y-or-n-p "No MCP tools in gptel!  Shut down all MCP servers? "))
         (dolist (server mcp-hub-servers)
-          (when (gethash (car server) mcp-server-connections)
-            (mcp-stop-server (car server))))))))
+          (let ((mcp-server-name (car server)))
+            (when (gethash (mcp--get-server-key buffer mcp-server-name) mcp-server-connections)
+              (mcp-stop-server buffer mcp-server-name))))))))
 
-(defun gptel-mcp--get-tools (&optional server-names)
+(defun gptel-mcp--get-server-names-from-existing-connections (buffer)
+  (cl-loop for mcp-server in (with-current-buffer buffer mcp-hub-servers)
+           for mcp-server-name = (car mcp-server)
+           when (not (eq (gethash (mcp--get-server-key buffer mcp-server-name) mcp-server-connections 'no-mcp-server-found) 'no-mcp-server-found))
+           collect mcp-server-name))
+
+(defun gptel-mcp--get-tools (buffer &optional server-names)
   "Return tools from running MCP servers.
 
 SERVER-NAMES is a list of server names to add tools from.  Add tools
-from all connected servers if it is nil."
+from all connected servers potentially keyed by BUFFER if it is nil."
+  (message "(get-tools %s %s)" buffer server-names)
   (unless server-names
-    (setq server-names (hash-table-keys mcp-server-connections)))
-  (let ((servers (mapcar (lambda (n) (gethash n mcp-server-connections))
+    (setq server-names (gptel-mcp--get-server-names-from-existing-connections buffer)))
+  (let ((servers (mapcar (lambda (server-name) (gethash (mcp--get-server-key buffer server-name) mcp-server-connections))
                          server-names)))
     (cl-mapcan
      (lambda (name server)
@@ -198,9 +208,9 @@ from all connected servers if it is nil."
                    tool-names))))
      server-names servers)))
 
-(defun gptel-mcp--activate-tools (&optional tools)
+(defun gptel-mcp--activate-tools (buffer &optional tools)
   "Activate TOOLS or all MCP tools in current gptel session."
-  (unless tools (setq tools (gptel-mcp--get-tools)))
+  (unless tools (setq tools (gptel-mcp--get-tools buffer)))
   (dolist (tool tools)
     (cl-pushnew (gptel-get-tool (list (plist-get tool :category)
                                       (plist-get tool :name)))
@@ -217,18 +227,19 @@ from all connected servers if it is nil."
     ;; update it with the newly selected tools.  Then set up gptel-tools.
     (condition-case err
         (gptel-mcp-connect
+         (or mcp-hub--buffer (current-buffer))
          nil (lambda () (when-let* ((transient--prefix)
-                               ((eq (oref transient--prefix command)
-                                    'gptel-tools)))
-                     (let ((state (transient-scope 'gptel-tools)))
-                       (plist-put state :tools
-                                  (delete-dups
-                                   (nconc (mapcar (lambda (tool)
-                                                    (list (gptel-tool-category tool)
-                                                          (gptel-tool-name tool)))
-                                                  gptel-tools)
-                                          (plist-get state :tools))))
-                       (transient-setup 'gptel-tools nil nil :scope state))))
+                                    ((eq (oref transient--prefix command)
+                                         'gptel-tools)))
+                          (let ((state (transient-scope 'gptel-tools)))
+                            (plist-put state :tools
+                                       (delete-dups
+                                        (nconc (mapcar (lambda (tool)
+                                                         (list (gptel-tool-category tool)
+                                                               (gptel-tool-name tool)))
+                                                       gptel-tools)
+                                               (plist-get state :tools))))
+                            (transient-setup 'gptel-tools nil nil :scope state))))
          t)
       (user-error (message "%s" (cadr err)))))
 
@@ -243,9 +254,7 @@ from all connected servers if it is nil."
     :inapt-if
     (lambda () (or (not (boundp 'mcp-hub-servers))
               (null mcp-hub-servers)
-              (cl-loop
-               for v being the hash-values of mcp-server-connections
-               never v)))
+              (null (gptel-mcp--get-server-names-from-existing-connections (or mcp-hub--buffer (current-buffer))))))
     (interactive)
     (call-interactively #'gptel-mcp-disconnect)
     ;; gptel-tools stores its state in its scope slot.  Retain the scope but
